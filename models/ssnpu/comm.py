@@ -2,9 +2,8 @@
 from collections import Counter
 
 from runtime.component import Component
-from runtime.protocol import (Dispatch, Complete, Consumed, Access, AccessDone, ReceivePrepare,
-                       PortFence, WriteReservations, RouterWrite, PublishReceive, TransferReply, core_name)
-from runtime.communication import (Accepted, Rejected, Completion, DataCommand, DataReply, request_from_dict)
+from runtime.protocol import Dispatch, Complete, Consumed, OpenTileStream, TileStreamReady, TileDataAccess, ReleaseTileStream, core_name
+from runtime.communication import Rejected, Completion, DataAccess, DataReply, CommSubmit
 from errors import ModelError
 
 
@@ -13,13 +12,15 @@ class CommPort(Component):
         super().__init__(name)
         self.nodes = instructions
         self.bindings, self.by_instruction = {}, {}
-        self.waiting, self.finished, self.retry = set(), {}, {}
+        self.waiting, self.dispatched, self.finished, self.retry = set(), set(), set(), {}
         self.waits = Counter()
+        self.completed_tokens = set()
         for key, instruction in instructions.items():
             token = instruction.raw['communication']['token']
             binding = self.bindings.setdefault(token, {})
             binding[instruction.raw['ir_op'].split('.')[1]] = instruction
-            binding['request'] = request_from_dict(instruction.raw['communication']['request'])
+            raw = instruction.raw['communication']['request']
+            binding['request'] = CommSubmit(instruction.core, name, token, raw)
             self.by_instruction[key] = token
 
     def finish(self, instruction):
@@ -31,17 +32,20 @@ class CommPort(Component):
             if isinstance(message, Dispatch):
                 instruction = self.nodes[message.instruction]
                 token = self.by_instruction[instruction.id]
-                self.observe(instruction.id, received=cycle, state='communication_pending')
                 if instruction.raw['ir_op'] == 'comm.submit':
-                    self.send('communit', self.bindings[token]['request'])
+                    self.observe(instruction.id, received=cycle, state='communication_pending')
+                    wait = self.bindings[token]['wait']
+                    self.send(core_name(instruction.core, 'tile'), OpenTileStream(instruction.id, wait.id))
                 else:
-                    self.waiting.add(token)
-            elif isinstance(message, Accepted):
-                binding = self.bindings[message.token]
-                self.retry.pop(message.token, None)
-                self.observe(binding['submit'].id, accepted=cycle)
+                    self.observe(instruction.id, received=cycle)
+                    self.dispatched.add(token)
+            elif isinstance(message, TileStreamReady):
+                token = self.by_instruction[message.submit]
+                binding = self.bindings[token]
+                self.waiting.add(token)
+                self.observe(binding['wait'].id, wait_start=cycle, state='communication_pending')
+                self.send('communit', binding['request'])
                 self.finish(binding['submit'])
-                # Source retention ends on data-read completion, not acceptance.
             elif isinstance(message, Rejected):
                 if not message.retryable:
                     raise ModelError(f'Communication request {message.token} rejected: {message.reason}')
@@ -50,58 +54,45 @@ class CommPort(Component):
             elif isinstance(message, Completion):
                 if message.status != 'success':
                     raise ModelError(f'Communication {message.token} fault (bindings quarantined): {message.error}')
-                self.finished[message.token] = message
-            elif isinstance(message, AccessDone):
-                token = self.by_instruction[message.instruction]
-                binding = self.bindings[token]
-                self.send(core_name(binding['submit'].core, 'tile'), Consumed(message.instruction))
-                self.send('communit', DataReply(token, 'source_ready'))
-                self.observe(message.instruction, source_read_complete=cycle)
-            elif isinstance(message, TransferReply):
-                self.send('communit', DataReply(self.by_instruction[message.instruction], message.event, message.detail))
-            elif isinstance(message, DataCommand):
+                if message.token in self.completed_tokens:
+                    raise ModelError('Duplicate communication completion')
                 binding = self.bindings[message.token]
-                submit, wait, request = binding['submit'], binding['wait'], binding['request']
-                expected = request.source if message.kind == 'read' else request.destination
-                if message.region != expected:
-                    self.send('communit', DataReply(message.token, 'fault', 'Data access binding/generation mismatch'))
-                    continue
+                submit = binding['submit']
+                self.send(core_name(submit.core, 'tile'), ReleaseTileStream(submit.id))
+                self.completed_tokens.add(message.token)
+                self.finished.add(message.token)
+            elif isinstance(message, DataAccess):
+                binding = self.bindings[message.token]
+                submit, wait = binding['submit'], binding['wait']
                 if message.kind == 'read':
-                    obj, version = submit.operands[0]
-                    command = Access(submit.id, message.token, version, False, message.region.nbytes, obj['dtype'])
-                elif message.kind == 'prepare':
-                    command = ReceivePrepare(wait.id, message.region.handle, message.detail)
-                elif message.kind == 'fence':
-                    command = PortFence(wait.id)
-                elif message.kind == 'reserve':
-                    command = WriteReservations(wait.id, message.detail)
-                elif message.kind == 'write':
-                    source, offset, size, _ = message.detail
-                    command = RouterWrite(wait.id, message.region.handle, source, offset, size)
-                elif message.kind == 'publish':
-                    command = PublishReceive(wait.id)
-                else:
-                    self.send('communit', DataReply(message.token, 'fault', 'Unknown data command'))
-                    continue
-                self.send(core_name(submit.core, 'tile'), command)
+                    binding.setdefault('reads', {})[message.access_id] = sum(stop - start for start, stop in message.ranges)
+                self.send(core_name(submit.core, 'tile'), TileDataAccess(submit.id, wait.id, message))
+            elif isinstance(message, DataReply):
+                if message.event == 'read_done':
+                    binding = self.bindings[message.token]
+                    binding['read_bytes'] = binding.get('read_bytes', 0) + binding['reads'].pop(message.access_id)
+                    if binding['read_bytes'] == binding['request'].request['send_bytes']:
+                        self.observe(binding['submit'].id, source_read_complete=cycle)
+                self.send('communit', message)
             else:
                 raise TypeError(message)
         for token, when in list(self.retry.items()):
             if when <= cycle:
                 self.send('communit', self.bindings[token]['request'])
                 del self.retry[token]
-        for token in sorted(self.waiting & self.finished.keys()):
+        for token in sorted(self.waiting & self.dispatched & self.finished):
             wait = self.bindings[token]['wait']
             self.finish(wait)
             self.send(core_name(wait.core, 'tile'), Consumed(wait.id))
             self.waiting.remove(token)
-            del self.finished[token]
+            self.dispatched.remove(token)
+            self.finished.remove(token)
 
     def next_event(self):
         return min(self.retry.values(), default=None)
 
     def is_idle(self):
-        return super().is_idle() and not (self.retry or self.waiting or self.finished)
+        return super().is_idle() and not (self.retry or self.waiting or self.dispatched or self.finished)
 
     def snapshot(self):
         return dict(super().snapshot(), waiting=sorted(self.waiting), completed=sorted(self.finished), retry=dict(self.retry))

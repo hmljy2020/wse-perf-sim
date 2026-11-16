@@ -28,6 +28,10 @@ ENGINES = {
     'shared_write': (256, 2, 'byte/cycle', 'Core'),
 }
 
+MEMORY_TRANSPORT_DEFAULTS = dict(throughput=32, latency=4, control_bytes=16, header_bytes=12,
+    inflight=8, sram_queue_depth=16, source='synthetic aggregate transport; core cycles; not SSM calibrated')
+
+
 HBM_DEFAULTS = dict(bandwidth_bytes_per_second=10_000_000_000_000,
                     per_core_bytes_per_cycle=128, startup_ns=0)
 
@@ -81,6 +85,11 @@ def validate_config(c):
         raise ModelError(f'Incomplete configuration: {exc}') from exc
     if "wse" in c:
         validate_wse(c)
+        c['memory_transport'] = MEMORY_TRANSPORT_DEFAULTS | c.get('memory_transport', {})
+        for key in ('throughput', 'latency', 'control_bytes', 'header_bytes', 'inflight', 'sram_queue_depth'):
+            value = c['memory_transport'][key]
+            if type(value) is not int or value < (0 if key in ('latency', 'header_bytes') else 1):
+                raise ModelError(f'Invalid memory transport parameter {key}')
     if 'hbm' in c:
         if 'wse' not in c:
             raise ModelError('HBM requires a WSE clock configuration')
@@ -97,10 +106,10 @@ def validate_config(c):
 
 # Values retain their provenance; none of the pending values are hardware calibration.
 WSE_PARAMETERS = {
-    'core_clock_hz': (1400000000, 'Hz', 'documented'),
+    'core_clock_hz': (1650000000, 'Hz', 'configured'),
     'noc_clock_hz': (2000000000, 'Hz', 'documented'),
     'link_bytes_per_cycle': (64, 'B/NoC cycle/direction', 'documented'),
-    'header_bytes': (12, 'B/flit', 'pending'),
+    'header_bytes': (12, 'B/flit', 'configured'),
     'hop_cycles': (1, 'NoC cycle', 'pending'),
     'tx_cdc_cycles': (2, 'NoC cycle', 'pending'),
     'rx_cdc_cycles': (2, 'NoC cycle', 'pending'),
@@ -109,7 +118,6 @@ WSE_PARAMETERS = {
     'guard_cycles': (1, 'NoC cycle', 'pending'),
     'slot_cycles': (1024, 'NoC cycle', 'pending'),
     'slots_per_period': (8, 'slots', 'pending'),
-    'epoch_bits': (8, 'bit', 'pending'),
     'sram_capacity_bytes': (384 * 1024 * 1024, 'B/core', 'documented'),
     'sram_bandwidth': (1000000000000, 'B/s/core, shared read/write', 'configured'),
     'sram_read_startup_ns': (100, 'ns', 'configured'),
@@ -121,10 +129,13 @@ def wse_config():
     c = default_config()
     c['name'] = 'wse40-shared-tile-pending'
     c['hbm'] = HBM_DEFAULTS.copy()
+    c['memory_transport'] = MEMORY_TRANSPORT_DEFAULTS.copy()
     c['wse'] = {k: dict(value=v, unit=u, status=s,
                          source=('WSE whitepaper v0.2' if s == 'documented' else
                                  'user-confirmed first-version model; 2026-11-13'))
                 for k, (v, u, s) in WSE_PARAMETERS.items()}
+    for key in ('core_clock_hz', 'header_bytes'):
+        c['wse'][key]['source'] = 'user-specified simulator configuration'
     # WSE targets are whole-core budgets, statically partitioned across PEs.
     # Keep default_config's synthetic per-PE profile unchanged.
     for name in ('cube', 'vector', 'exp', 'cast', 'reduce'):
@@ -147,6 +158,7 @@ def wse_config():
 
 def validate_wse(c):
     p = c['wse']
+    p.pop('epoch_bits', None)  # Read existing profile files that still have this field.
     if set(p) != set(WSE_PARAMETERS):
         raise ModelError('WSE parameter keys differ from the supported profile')
     zero_ok = {'tx_cdc_cycles', 'rx_cdc_cycles', 'alignment_cycles', 'arm_cycles',
@@ -162,8 +174,12 @@ def validate_wse(c):
     if c['engines']['shared_write'].get('dtype_overrides'):
         raise ModelError('WSE reservations require one dtype-independent shared write service')
 
-def platform_spec(config):
-    """Only network clocks/rates and declared endpoint write service cross over."""
-    return dict(network={k: v['value'] for k, v in config['wse'].items() if not k.startswith('sram_')},
-                write_service={k: config['engines']['shared_write'][k] for k in ('throughput', 'latency')},
-                endpoint_command_cycles=1, reservation_roundtrip_cycles=4)
+def platform_spec(config, *, access_bytes, tx_bytes, rx_bytes):
+    """Use core service declarations and explicitly supplied endpoint limits."""
+    platform = dict(network={k: v['value'] for k, v in config['wse'].items() if not k.startswith('sram_')},
+                    write_service={k: config['engines']['shared_write'][k] for k in ('throughput', 'latency')})
+    platform['read_service'] = {
+        k: config['engines']['shared_read'][k] for k in ('throughput', 'latency')
+    }
+    platform.update(access_bytes=access_bytes, tx_bytes=tx_bytes, rx_bytes=rx_bytes)
+    return platform

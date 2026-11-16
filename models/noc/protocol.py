@@ -1,4 +1,4 @@
-"""Compatibility exports; shared contracts live in runtime.communication."""
-from runtime.communication import (DataRange, CommRequest, Accepted, Rejected, Completion,
-                                   DataCommand, DataReply, digest, request_from_dict)
+"""Public exports for the common communication contract."""
+from runtime.communication import (CommRequest, CommSubmit, Completion, DataAccess, DataReply,
+                                   Rejected, SendLayout, ReceiveLayout, digest, coverage)
 from config import platform_spec

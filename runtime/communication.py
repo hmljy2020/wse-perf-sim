@@ -2,6 +2,9 @@
 from dataclasses import dataclass
 import hashlib
 import json
+from typing import NotRequired, TypedDict
+
+from errors import ModelError
 
 
 def digest(value):
@@ -10,35 +13,6 @@ def digest(value):
     normalized = json.loads(json.dumps(value, allow_nan=False))
     encoded = json.dumps(normalized, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
     return hashlib.sha256(encoded).hexdigest()
-
-
-@dataclass(frozen=True)
-class DataRange:
-    handle: tuple  # Opaque owner-issued binding + generation; WSE never decodes it.
-    offset: int
-    nbytes: int
-    capacity: int
-
-
-@dataclass(frozen=True)
-class CommRequest:
-    token: str
-    endpoint: str
-    node: int
-    operation: str
-    epoch: int
-    domain: str
-    members: tuple
-    version: str
-    route_bits: tuple
-    source: DataRange
-    destination: DataRange
-    destination_offset: int
-
-
-@dataclass(frozen=True)
-class Accepted:
-    token: str
 
 
 @dataclass(frozen=True)
@@ -57,26 +31,78 @@ class Completion:
 
 
 @dataclass(frozen=True)
-class DataCommand:
+class SendLayout:
+    src_offset: int
+    row_count: int
+    row_bytes: int
+    src_row_stride: int
+    recv_sym_base: str
+    self_off: int
+    recv_row_stride: int
+    route_bits: int
+    self_copy: bool = False
+
+
+@dataclass(frozen=True)
+class ReceiveLayout:
+    recv_sym_base: str
+    capacity: int
+    exp_val: int
+    valid_ranges: tuple  # Half-open logical ranges, including all non-padding bytes.
+
+
+class CommRequest(TypedDict):
+    opcode: int
+    route_bits: NotRequired[int]
+    send_bytes: NotRequired[int]
+    expected_receive_bytes: NotRequired[int]
+
+
+def request_for(opcode, send, receive):
+    request = CommRequest(opcode=opcode)
+    if send is not None:
+        request.update(route_bits=send.route_bits, send_bytes=send.row_count * send.row_bytes)
+    if receive is not None:
+        request['expected_receive_bytes'] = receive.exp_val
+    return request
+
+
+@dataclass(frozen=True)
+class CommSubmit:
+    node: int
+    endpoint: str
+    token: str  # Simulator correlation metadata, outside the submitted operands.
+    request: CommRequest
+
+
+@dataclass(frozen=True)
+class DataAccess:
     token: str
     kind: str
-    region: DataRange
-    detail: object = None
+    access_id: int
+    ranges: tuple  # Compiled half-open storage ranges for this flit.
+    node: int
+    data: bytes | None = None
 
 
 @dataclass(frozen=True)
 class DataReply:
     token: str
     event: str
+    access_id: int
     detail: object = None
+    node: int | None = None  # Endpoint-scoped request identity, independent of origin.
 
 
-def request_from_dict(data):
-    data = dict(data)
-    for key in ('source', 'destination'):
-        region = dict(data[key])
-        region['handle'] = tuple(region['handle'])
-        data[key] = DataRange(**region)
-    data['members'], data['route_bits'] = tuple(data['members']), tuple(data['route_bits'])
-    return CommRequest(**data)
-
+def coverage(ranges, capacity):
+    """Normalize adjacent ranges while rejecting overlaps and invalid bounds."""
+    merged = []
+    for start, end in sorted(ranges):
+        if (type(start) is not int or type(end) is not int or not 0 <= start < end <= capacity
+                or (merged and start < merged[-1][1])):
+            raise ModelError('Overlapping or out-of-range receive bytes')
+        if merged and start == merged[-1][1]:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged

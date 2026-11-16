@@ -15,7 +15,7 @@ def build_report(sim):
     instruction_events = []
     milestones = {'admitted', 'admission_received', 'allocation_request', 'allocated', 'issue', 'received', 'operands_ready',
                   'compute_start', 'compute_end', 'writeback_start', 'writeback_end',
-                  'complete', 'rob_complete', 'retire', 'accepted', 'source_read_complete'}
+                  'complete', 'rob_complete', 'retire', 'accepted', 'source_read_complete', 'wait_start'}
     # complete 是发送 Complete 的时刻，rob_complete 是 ROB 收到消息的时刻，retire 是按序退休。
     # 三者分别保留，便于区分执行延迟、消息传递和退休等待。
     for name, component in sorted(sim.components.items()):
@@ -108,6 +108,10 @@ def build_report(sim):
         report['messages'] = sim.clock.messages
     if 'wse' in sim.config:
         report['total_time_ns'] = cycle * 1e9 / sim.config['wse']['core_clock_hz']['value']
+    if 'memory-network' in sim.components:
+        report['memory_network_events'] = getattr(sim.components['memory-network'], 'events', [])
+        report['sram_events'] = [e for c in sim.components.values() if c.name.endswith('/sram') for e in getattr(c, 'events', [])]
+        report['assumptions'].append('SRAM startup is pipelined latency; local/remote/HBM accesses share each target SRAM port. Remote memory uses an independent aggregate link cost model.')
     if sim.hbm is not None:
         report['hbm_events'] = sim.hbm.events
         report['assumptions'].append(
